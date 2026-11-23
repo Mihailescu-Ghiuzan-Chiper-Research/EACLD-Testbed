@@ -1,0 +1,15 @@
+.git
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.venv/
+**/venv/
+**/volumes/
+**/secrets/
+**/.env
+**/.env.*
+**/*.key
+**/*.pem
+edge/config/passwd
+nodes/config/nodes.json
+*.log

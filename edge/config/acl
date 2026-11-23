@@ -1,0 +1,13 @@
+user node
+topic write raw/+
+
+user g1
+topic read raw/+
+topic write transit/g1/+
+
+user g2
+topic read transit/g1/+
+topic write accepted/+
+
+user core
+topic read accepted/+

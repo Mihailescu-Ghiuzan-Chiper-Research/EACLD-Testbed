@@ -1,0 +1,79 @@
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: eacld-mosquitto
+    restart: unless-stopped
+    ports:
+      - "10.60.10.14:1883:1883"
+    volumes:
+      - ./config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./config/acl:/mosquitto/config/acl:ro
+      - ./config/passwd:/mosquitto/config/passwd:ro
+      - ./volumes/mosquitto:/mosquitto/data
+
+  eacld-g1:
+    build:
+      context: ..
+      dockerfile: edge/services/g1/Dockerfile
+    image: eacld-g1:0.1.0
+    container_name: eacld-g1
+    restart: unless-stopped
+    depends_on:
+      - mosquitto
+    environment:
+      EACLD_MQTT_HOST: mosquitto
+      EACLD_MQTT_PORT: "1883"
+      EACLD_G1_MQTT_PASSWORD_FILE: /run/eacld/mqtt_password
+    volumes:
+      - ./secrets/g1_mqtt_password:/run/eacld/mqtt_password:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8300/healthz', timeout=3).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  eacld-g2:
+    build:
+      context: ..
+      dockerfile: edge/services/g2/Dockerfile
+    image: eacld-g2:0.1.0
+    container_name: eacld-g2
+    restart: unless-stopped
+    depends_on:
+      - mosquitto
+    environment:
+      EACLD_MQTT_HOST: mosquitto
+      EACLD_MQTT_PORT: "1883"
+      EACLD_G2_MQTT_PASSWORD_FILE: /run/eacld/mqtt_password
+    volumes:
+      - ./secrets/g2_mqtt_password:/run/eacld/mqtt_password:ro
+      - g2-control:/run/eacld/g2
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8300/healthz', timeout=3).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  eacld-edge-control:
+    build:
+      context: ..
+      dockerfile: edge/services/edge-control/Dockerfile
+    image: eacld-edge-control:0.1.0
+    container_name: eacld-edge-control
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - eacld-g2
+    volumes:
+      - g2-control:/run/eacld/g2
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://10.60.30.14:8300/healthz', timeout=3).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  g2-control:

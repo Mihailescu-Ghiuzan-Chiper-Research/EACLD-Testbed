@@ -1,0 +1,8 @@
+{
+  "protocol_version": 1,
+  "telemetry_interval_ms": 1000,
+  "nodes": [
+    {"node_id": 1, "zone_id": 1, "key_version": 1, "bias_temperature_mC": 0, "bias_humidity_mPct": 0},
+    {"node_id": 2, "zone_id": 1, "key_version": 1, "bias_temperature_mC": 0, "bias_humidity_mPct": 0}
+  ]
+}
