@@ -16,8 +16,9 @@ import signal
 import threading
 from typing import Iterator
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
 import uvicorn
 
 from eacld_contracts.frame import CHALLENGE_RESPONSE_TYPE, TELEMETRY_TYPE
@@ -33,6 +34,15 @@ SERVICE_VERSION = "0.1.0"
 CONFIG_PATH = "/etc/eacld/nodes.json"
 KEYS_PATH = "/run/eacld/node_keys.json"
 MQTT_PASSWORD_PATH = "/run/eacld/mqtt_password"
+
+
+class BiasUpdate(BaseModel):
+    """Private experiment-control request, never included in public telemetry."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    node_id: int = Field(ge=0, le=65535)
+    bias_temperature_mC: int = Field(ge=-(1 << 31), lt=(1 << 31))
+    bias_humidity_mPct: int = Field(ge=-(1 << 31), lt=(1 << 31))
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,13 +126,45 @@ class NodesService:
             ) for item in config.nodes
         }
         self.sensors = {item.node_id: VirtualSensor(item.bias) for item in config.nodes}
+        self._sensor_lock = threading.RLock()
+        self._bias_revision = {item.node_id: 0 for item in config.nodes}
+
+    def get_bias(self, node_id: int) -> dict[str, int]:
+        _bounded_int(node_id, "node_id", 0, 65535)
+        with self._sensor_lock:
+            if node_id not in self.sensors:
+                raise KeyError("unknown node_id")
+            bias = self.sensors[node_id].bias
+            return {
+                "node_id": node_id,
+                "bias_temperature_mC": bias.temperature_mC,
+                "bias_humidity_mPct": bias.humidity_mPct,
+                "revision": self._bias_revision[node_id],
+            }
+
+    def set_bias(self, node_id: int, temperature_mC: int,
+                 humidity_mPct: int) -> dict[str, int]:
+        _bounded_int(node_id, "node_id", 0, 65535)
+        bias = SensorBias(temperature_mC, humidity_mPct)
+        with self._sensor_lock:
+            if node_id not in self.sensors:
+                raise KeyError("unknown node_id")
+            self.sensors[node_id] = VirtualSensor(bias)
+            self._bias_revision[node_id] += 1
+            return {
+                "node_id": node_id,
+                "bias_temperature_mC": bias.temperature_mC,
+                "bias_humidity_mPct": bias.humidity_mPct,
+                "revision": self._bias_revision[node_id],
+            }
 
     def _emit(self, node_id: int, message_type: int, nonce: bytes | None = None):
         if node_id not in self.producers:
             raise KeyError("unknown node_id")
         observation = self.plant.read()
-        measurement = self.sensors[node_id].measure(observation)
-        return self.producers[node_id].emit(message_type, measurement, nonce=nonce)
+        with self._sensor_lock:
+            measurement = self.sensors[node_id].measure(observation)
+            return self.producers[node_id].emit(message_type, measurement, nonce=nonce)
 
     def challenge(self, node_id: int, nonce: bytes):
         return self._emit(node_id, CHALLENGE_RESPONSE_TYPE, nonce)
@@ -131,10 +173,11 @@ class NodesService:
         """Read the common plant once and sign every configured node's view."""
         observation = self.plant.read()
         output = []
-        for item in self.config.nodes:
-            measurement = self.sensors[item.node_id].measure(observation)
-            frame = self.producers[item.node_id].emit(TELEMETRY_TYPE, measurement)
-            output.append((raw_topic(item.node_id), frame.to_bytes()))
+        with self._sensor_lock:
+            for item in self.config.nodes:
+                measurement = self.sensors[item.node_id].measure(observation)
+                frame = self.producers[item.node_id].emit(TELEMETRY_TYPE, measurement)
+                output.append((raw_topic(item.node_id), frame.to_bytes()))
         return tuple(output)
 
 
@@ -209,9 +252,10 @@ async def publish_loop(service: NodesService, publisher: MqttPublisher) -> None:
         await asyncio.sleep(interval_s)
 
 
-def create_control_app(*, allowed_sources: frozenset[str] =
+def create_control_app(service: NodesService | None = None, *,
+                       allowed_sources: frozenset[str] =
                        frozenset({"10.60.30.10", "127.0.0.1"})) -> FastAPI:
-    """Health-only agent on NET-CONTROL; deny other sources and endpoints."""
+    """Restricted NET-CONTROL health and experimental node-bias operations."""
     app = FastAPI(title="eacld-nodes control", docs_url=None,
                   redoc_url=None, openapi_url=None)
 
@@ -225,6 +269,26 @@ def create_control_app(*, allowed_sources: frozenset[str] =
     @app.get("/healthz")
     def health() -> dict[str, str]:
         return {"status": "ok", "service_version": SERVICE_VERSION}
+
+    if service is not None:
+        @app.get("/v1/nodes/bias")
+        def get_node_bias(node_id: int) -> dict[str, int]:
+            try:
+                return service.get_bias(node_id)
+            except KeyError:
+                raise HTTPException(status_code=404, detail="unknown node") from None
+            except ValueError:
+                raise HTTPException(status_code=422, detail="invalid node") from None
+
+        @app.post("/v1/nodes/bias")
+        def update_node_bias(command: BiasUpdate) -> dict[str, int]:
+            try:
+                return service.set_bias(
+                    command.node_id, command.bias_temperature_mC,
+                    command.bias_humidity_mPct,
+                )
+            except KeyError:
+                raise HTTPException(status_code=404, detail="unknown node") from None
 
     return app
 
@@ -243,7 +307,7 @@ async def serve(service: NodesService, publisher: MqttPublisher) -> None:
         create_probe_app(service), host="0.0.0.0", port=8202,
         log_level="info", access_log=False))
     control = SignalManagedServer(uvicorn.Config(
-        create_control_app(), host="0.0.0.0", port=8300,
+        create_control_app(service), host="0.0.0.0", port=8300,
         log_level="info", access_log=False))
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
