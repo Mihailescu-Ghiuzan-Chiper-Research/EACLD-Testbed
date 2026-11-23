@@ -1,0 +1,50 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: eacld-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: eacld
+      POSTGRES_USER: eacld
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
+    volumes:
+      - ./volumes/postgres:/var/lib/postgresql/data
+      - ./secrets/pg_password:/run/secrets/pg_password:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eacld -d eacld"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  eacld-core:
+    build:
+      context: ..
+      dockerfile: core/services/core/Dockerfile
+    image: eacld-core:0.1.0
+    container_name: eacld-core
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "10.60.30.15:8300:8300"
+    environment:
+      EACLD_PG_HOST: postgres
+      EACLD_PG_PORT: "5432"
+      EACLD_PG_DB: eacld
+      EACLD_PG_USER: eacld
+      EACLD_PG_PASSWORD_FILE: /run/eacld/pg_password
+      EACLD_CORE_NODE_KEYS: /run/eacld/node_keys.json
+      EACLD_CORE_MQTT_PASSWORD_FILE: /run/eacld/mqtt_password
+      EACLD_MQTT_HOST: 10.60.10.14
+      EACLD_MQTT_PORT: "1883"
+    volumes:
+      - ./secrets/pg_password:/run/eacld/pg_password:ro
+      - ./secrets/node_keys.json:/run/eacld/node_keys.json:ro
+      - ./secrets/mqtt_password:/run/eacld/mqtt_password:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8300/healthz', timeout=3).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

@@ -1,0 +1,21 @@
+services:
+  eacld-nodes:
+    build:
+      context: ..
+      dockerfile: nodes/services/nodes/Dockerfile
+    image: eacld-nodes:0.1.0
+    container_name: eacld-nodes
+    restart: unless-stopped
+    ports:
+      - "10.60.20.12:8202:8202"
+      - "10.60.30.12:8300:8300"
+    volumes:
+      - ./config/nodes.json:/etc/eacld/nodes.json:ro
+      - ./secrets/node_keys.json:/run/eacld/node_keys.json:ro
+      - ./secrets/mqtt_password:/run/eacld/mqtt_password:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8300/healthz', timeout=3).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

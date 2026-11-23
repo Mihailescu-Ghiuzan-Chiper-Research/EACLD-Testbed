@@ -1,0 +1,20 @@
+services:
+  eacld-control:
+    build:
+      context: ./services/control
+      dockerfile: Dockerfile
+    image: eacld-control:0.1.0
+    container_name: eacld-control
+    restart: unless-stopped
+    ports:
+      - "10.60.40.10:8100:8100"
+    environment:
+      EACLD_PRIVATE_DB: /var/lib/eacld/private/state.sqlite3
+    volumes:
+      - ./volumes/private:/var/lib/eacld/private
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/healthz', timeout=3).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

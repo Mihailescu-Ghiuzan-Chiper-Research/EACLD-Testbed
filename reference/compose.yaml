@@ -1,0 +1,17 @@
+services:
+  eacld-reference:
+    build:
+      context: ..
+      dockerfile: reference/services/reference/Dockerfile
+    image: eacld-reference:0.1.0
+    container_name: eacld-reference
+    restart: unless-stopped
+    ports:
+      - "10.60.20.13:8201:8201"
+      - "10.60.30.13:8300:8300"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8300/healthz', timeout=3).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
