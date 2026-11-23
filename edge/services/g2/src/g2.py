@@ -72,6 +72,8 @@ class Gateway2:
         self._lock = threading.Lock()
         self._pending: dict[int, Mutation | Replay] = {}
         self._last_forwarded: dict[int, bytes] = {}
+        self._mutation_events: dict[int, dict] = {}
+        self._mutation_counter = 0
 
     def stage_mutation(self, node_id: int, *, offset: int, xor_mask: int) -> None:
         """XOR one header byte of the next 94-byte frame; keep MAC unchanged."""
@@ -96,6 +98,27 @@ class Gateway2:
         _check_node_id(node_id)
         with self._lock:
             self._pending.pop(node_id, None)
+
+    def intervention_status(self, node_id: int) -> dict:
+        """Expose one-shot action status and the actual G2 H3 wire evidence.
+
+        The previous mutation event survives clear; status never includes
+        sensor keys, private plant state or research cause labels.
+        """
+        _check_node_id(node_id)
+        with self._lock:
+            pending = self._pending.get(node_id)
+            return {
+                "status": "ok", "node_id": node_id,
+                "pending_action": (
+                    "mutate" if isinstance(pending, Mutation)
+                    else "replay" if isinstance(pending, Replay) else None
+                ),
+                "last_mutation": (
+                    dict(self._mutation_events[node_id])
+                    if node_id in self._mutation_events else None
+                ),
+            }
 
     def on_connect(self, client, _userdata, _flags, reason_code, _properties) -> None:
         self.ready.clear()
@@ -150,6 +173,14 @@ class Gateway2:
             if len(outgoing) == FRAME_SIZE:
                 self._last_forwarded[node_id] = outgoing
             if isinstance(action, Mutation) and len(payload) == FRAME_SIZE:
+                self._mutation_counter += 1
+                self._mutation_events[node_id] = {
+                    "event_id": self._mutation_counter,
+                    "offset": action.offset,
+                    "xor_mask": action.xor_mask,
+                    "original_frame_hex": payload.hex(),
+                    "mutated_frame_hex": outgoing.hex(),
+                }
                 self._pending.pop(node_id, None)
             elif isinstance(action, Replay):
                 result = client.publish(target, action.payload, qos=1, retain=False)
@@ -217,6 +248,8 @@ def create_command_server(gateway: Gateway2, path: str = CONTROL_SOCKET):
                 elif action == "clear" and set(request) == {"action", "node_id"}:
                     gateway.clear_intervention(request["node_id"])
                     reply = {"status": "ok"}
+                elif action == "status" and set(request) == {"action", "node_id"}:
+                    reply = gateway.intervention_status(request["node_id"])
                 else:
                     raise ValueError("unsupported command or fields")
             except (ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
