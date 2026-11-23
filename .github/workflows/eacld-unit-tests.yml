@@ -1,5 +1,8 @@
 name: EACLD service unit tests
 on:
+  push:
+    branches:
+      - feature/h4-experiment-runner
   workflow_dispatch:
 
 jobs:
@@ -32,3 +35,39 @@ jobs:
         run: PYTHONPATH=core/vendor/e0/EACLD_E0_Experimental_Package python -m pytest -q core/vendor/e0/EACLD_E0_Experimental_Package/tests/test_core.py
       - name: Test VM-CORE service and live integration
         run: PYTHONPATH=core/services/core:shared:core/vendor/e0/EACLD_E0_Experimental_Package python -m unittest discover -s core/tests -v
+
+  control:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate four scenario runners and S3 V4 block generation
+        run: python -m unittest discover -s control/tests -p 'test_h?_run.py' -v && python -m unittest discover -s control/tests -p test_experiment_compatibility.py -v && python -m unittest discover -s control/tests -p test_distributed_blocks.py -v
+      - name: Verify complete 1600-episode plan without contacting the testbed
+        run: python control/experiments/distributed_blocks.py --plan-only
+
+  nodes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install VM-NODES dependencies
+        run: python -m pip install -r nodes/services/nodes/requirements.txt httpx
+      - name: Test node fault controls on HTTP interfaces
+        run: PYTHONPATH=nodes/services/nodes:shared python -m unittest discover -s nodes/tests -v
+
+  reference:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install VM-REFERENCE dependencies
+        run: python -m pip install -r reference/services/reference/requirements.txt httpx
+      - name: Test reference fault controls on HTTP interfaces
+        run: PYTHONPATH=reference/services/reference:shared python -m unittest discover -s reference/tests -v

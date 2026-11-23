@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict
 
 from eacld_contracts.interfaces import parse_challenge_request
+from eacld_contracts.probe_condition import ProbeCondition
 
 
 class ChallengeRequest(BaseModel):
@@ -22,9 +23,10 @@ class ChallengeResponse(BaseModel):
     frame_hex: str
 
 
-def create_probe_app(service) -> FastAPI:
+def create_probe_app(service, condition: ProbeCondition | None = None) -> FastAPI:
     app = FastAPI(title="eacld-nodes challenge", docs_url=None,
                   redoc_url=None, openapi_url=None)
+    condition = condition or ProbeCondition()
 
     @app.post("/v1/challenge", response_model=ChallengeResponse)
     def challenge(request: ChallengeRequest) -> ChallengeResponse:
@@ -35,6 +37,7 @@ def create_probe_app(service) -> FastAPI:
         if node_id not in service.producers:
             raise HTTPException(status_code=404, detail="unknown node_id")
         try:
+            condition.apply()
             frame = service.challenge(node_id, nonce)
         except (OSError, RuntimeError, ValueError):
             raise HTTPException(status_code=503, detail="plant observation unavailable") from None

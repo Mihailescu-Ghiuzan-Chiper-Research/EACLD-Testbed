@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import socket
+from urllib.parse import parse_qs, urlsplit
 
 LOGGER = logging.getLogger(__name__)
 VERSION = "0.1.0"
@@ -19,6 +20,7 @@ CONTROL_PORT = 8300
 CONTROL_SOURCE = "10.60.30.10"
 G2_SOCKET = "/run/eacld/g2/control.sock"
 MAX_BODY = 1024
+MAX_RESPONSE = 4096
 
 
 def request_g2(command: dict, *, socket_path: str = G2_SOCKET) -> dict:
@@ -30,14 +32,14 @@ def request_g2(command: dict, *, socket_path: str = G2_SOCKET) -> dict:
         client.connect(socket_path)
         client.sendall(data)
         chunks = bytearray()
-        while len(chunks) <= MAX_BODY:
+        while len(chunks) <= MAX_RESPONSE:
             part = client.recv(1024)
             if not part:
                 break
             chunks.extend(part)
             if b"\n" in part:
                 break
-    if len(chunks) > MAX_BODY or b"\n" not in chunks:
+    if len(chunks) > MAX_RESPONSE or b"\n" not in chunks:
         raise OSError("invalid G2 control response")
     response = json.loads(bytes(chunks).split(b"\n", 1)[0])
     if not isinstance(response, dict) or response.get("status") not in ("ok", "error", "unavailable"):
@@ -59,12 +61,39 @@ def _validate_command(value: object) -> dict:
             raise ValueError("offset must be a header byte index")
         if type(value["xor_mask"]) is not int or not 1 <= value["xor_mask"] <= 255:
             raise ValueError("xor_mask must be in [1, 255]")
-    elif action in ("replay", "clear"):
+    elif action == "replay":
+        if set(value) not in (
+            {"action", "node_id"},
+            {"action", "node_id", "frame_hex"},
+        ):
+            raise ValueError("unexpected replay fields")
+        if "frame_hex" in value:
+            frame = value["frame_hex"]
+            if (not isinstance(frame, str) or len(frame) != 188
+                    or any(ch not in "0123456789abcdef" for ch in frame)):
+                raise ValueError("invalid replay frame_hex")
+    elif action == "clear":
         if set(value) != {"action", "node_id"}:
-            raise ValueError("unexpected command fields")
+            raise ValueError("unexpected clear fields")
     else:
         raise ValueError("unsupported intervention action")
     return value
+
+
+def _status_node(path: str) -> int:
+    url = urlsplit(path)
+    if url.path != "/v1/g2/intervention/status":
+        raise ValueError("unexpected status endpoint")
+    query = parse_qs(url.query, keep_blank_values=True)
+    if set(query) != {"node_id"} or len(query["node_id"]) != 1:
+        raise ValueError("invalid status query")
+    value = query["node_id"][0]
+    if not value.isascii() or not value.isdecimal():
+        raise ValueError("invalid node_id")
+    node = int(value)
+    if not 0 <= node <= 65535 or str(node) != value:
+        raise ValueError("node_id is not canonical uint16")
+    return node
 
 
 def create_server(*, host: str = CONTROL_HOST, port: int = CONTROL_PORT,
@@ -85,21 +114,41 @@ def create_server(*, host: str = CONTROL_HOST, port: int = CONTROL_PORT,
             return source == allowed_source or (health and source in ("127.0.0.1", CONTROL_HOST))
 
         def do_GET(self) -> None:
-            if not self.is_authorized(health=True):
+            if self.path == "/healthz":
+                if not self.is_authorized(health=True):
+                    self.send_json(403, {"detail": "forbidden"})
+                    return
+                try:
+                    response = request_g2({"action": "health"}, socket_path=socket_path)
+                    healthy = response["status"] == "ok"
+                except (OSError, ValueError, json.JSONDecodeError):
+                    healthy = False
+                self.send_json(200 if healthy else 503, {
+                    "status": "ok" if healthy else "unavailable",
+                    "service_version": VERSION,
+                })
+                return
+            if not self.is_authorized(health=False):
                 self.send_json(403, {"detail": "forbidden"})
                 return
-            if self.path != "/healthz":
+            if not self.path.startswith("/v1/g2/intervention/status"):
                 self.send_json(404, {"detail": "not found"})
                 return
             try:
-                response = request_g2({"action": "health"}, socket_path=socket_path)
-                healthy = response["status"] == "ok"
+                node = _status_node(self.path)
+            except ValueError:
+                self.send_json(400, {"detail": "invalid intervention status query"})
+                return
+            try:
+                reply = request_g2({"action": "status", "node_id": node},
+                                   socket_path=socket_path)
             except (OSError, ValueError, json.JSONDecodeError):
-                healthy = False
-            self.send_json(200 if healthy else 503, {
-                "status": "ok" if healthy else "unavailable",
-                "service_version": VERSION,
-            })
+                self.send_json(503, {"detail": "G2 control unavailable"})
+                return
+            if reply.get("status") != "ok":
+                self.send_json(503, {"detail": "G2 status unavailable"})
+                return
+            self.send_json(200, reply)
 
         def do_POST(self) -> None:
             if not self.is_authorized(health=False):

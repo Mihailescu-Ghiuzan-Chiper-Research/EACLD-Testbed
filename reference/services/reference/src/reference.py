@@ -19,7 +19,8 @@ import urllib.request
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
+from eacld_contracts.probe_condition import ProbeCondition
 import uvicorn
 
 from eacld_contracts.interfaces import PLANT_STATE, REFERENCE_READ
@@ -83,6 +84,12 @@ class ReferenceReadResponse(BaseModel):
     timestamp: str
 
 
+class ProbeConditionUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    unavailable: bool
+    latency_ms: int = Field(ge=0, le=2000)
+
+
 class HealthResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     status: str
@@ -109,15 +116,18 @@ class ReferenceAcquisition:
         )
 
 
-def create_probe_app(acquisition: ReferenceAcquisition | None = None) -> FastAPI:
+def create_probe_app(acquisition: ReferenceAcquisition | None = None,
+                     condition: ProbeCondition | None = None) -> FastAPI:
     """NET-PROBE application: only POST /v1/reference/read is exposed."""
     acquisition = acquisition or ReferenceAcquisition(PlantReferenceClient())
+    condition = condition or ProbeCondition()
     app = FastAPI(title="eacld-reference probe", version=SERVICE_VERSION,
                   docs_url=None, redoc_url=None, openapi_url=None)
 
     @app.post(REFERENCE_READ.path, response_model=ReferenceReadResponse)
     def reference_read() -> ReferenceReadResponse:
         try:
+            condition.apply()
             return acquisition.read()
         except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
             # Fail closed, without returning upstream data or exception text.
@@ -128,11 +138,13 @@ def create_probe_app(acquisition: ReferenceAcquisition | None = None) -> FastAPI
     return app
 
 
-def create_control_app(*, allowed_sources: frozenset[str] =
+def create_control_app(*, condition: ProbeCondition | None = None,
+                       allowed_sources: frozenset[str] =
                        frozenset({"10.60.30.10", "127.0.0.1"})) -> FastAPI:
     """NET-CONTROL health-only API, restricted to VM-CONTROL and local checks."""
     app = FastAPI(title="eacld-reference control", version=SERVICE_VERSION,
                   docs_url=None, redoc_url=None, openapi_url=None)
+    condition = condition or ProbeCondition()
 
     @app.middleware("http")
     async def restrict_source(request: Request, call_next):
@@ -144,6 +156,14 @@ def create_control_app(*, allowed_sources: frozenset[str] =
     @app.get("/healthz", response_model=HealthResponse)
     def health() -> HealthResponse:
         return HealthResponse(status="ok", service_version=SERVICE_VERSION)
+
+    @app.get("/v1/probe-condition")
+    def probe_condition() -> dict:
+        return condition.snapshot()
+
+    @app.post("/v1/probe-condition")
+    def set_probe_condition(command: ProbeConditionUpdate) -> dict:
+        return condition.configure(**command.model_dump())
 
     return app
 
@@ -158,11 +178,12 @@ class SignalManagedServer(uvicorn.Server):
 
 async def serve(acquisition: ReferenceAcquisition | None = None) -> None:
     """Run separate NET-PROBE and NET-CONTROL listeners in one container."""
+    condition = ProbeCondition()
     probe = SignalManagedServer(uvicorn.Config(
-        create_probe_app(acquisition), host="0.0.0.0", port=8201,
+        create_probe_app(acquisition, condition), host="0.0.0.0", port=8201,
         log_level="info", access_log=False))
     control = SignalManagedServer(uvicorn.Config(
-        create_control_app(), host="0.0.0.0", port=8300,
+        create_control_app(condition=condition), host="0.0.0.0", port=8300,
         log_level="info", access_log=False))
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

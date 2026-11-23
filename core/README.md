@@ -27,7 +27,7 @@ Example diagnostic request:
       "high_delta_mC": 3000
     }
 
-The diagnosis request specifies operating mode, baseline and temperature threshold. The selected accepted telemetry is used for E0 inference, which chooses verification actions under the finite-horizon policy. The persisted result contains posterior probabilities, selected checks, observable outcomes, costs, latency and risk. Intervention ground truth remains on VM-CONTROL.
+The diagnosis request supplies operating mode, baseline and temperature threshold. The API defaults to the latest accepted telemetry; `expected_telemetry_id` enforces the latest-record identity for H1/H2 (HTTP 409 on mismatch), while `selected_telemetry_id` selects a specific persisted record for H3/H4. These two selection parameters are mutually exclusive. The E0 policy chooses verification actions and persists posterior probabilities, selected checks, observable outcomes, costs, latency and risk. Intervention ground truth remains on VM-CONTROL.
 
 VM-CONTROL initiates each diagnostic episode after selecting the telemetry record.
 
@@ -51,3 +51,43 @@ VM-CORE has NET-DATA 10.60.10.15, NET-PROBE 10.60.20.15 and NET-CONTROL 10.60.30
 `core/tests/test_core_service.py` covers HMAC verification, keyring and topic handling, active probes, nonce verification, E0 inference integration, MQTT ingestion and restricted operator control. The nine E0 mathematical core tests are included in the suite. The consolidated H1–H4 regression script loads the E0 source package through `core/vendor/e0/EACLD_E0_Experimental_Package`. Block B01 passed 72 regression tests; GitHub Actions provides a manual execution workflow.
 
 Distributed B01 execution exercised MQTT transport, persistent telemetry records and E0 inference across the five virtual machines.
+
+
+## Operator evidence API (H1–H4)
+
+VM-CONTROL (10.60.30.10) accesses the following source-restricted NET-CONTROL routes:
+
+- `GET /v1/telemetry/latest?node_id=1`: the newest accepted frame for
+  that node, including its stable database ID, observable decoded values,
+  raw frame hexadecimal bytes, HMAC status and freshness classification.
+- `GET /v1/telemetry/match?node_id=1&after_id=<id>&frame_hex=<188-lowercase-hex>`:
+  the earliest exact 94-byte match after a pre-intervention telemetry
+  watermark. This avoids losing the single mutated H3 frame when a newer
+  normal frame is received.
+- `POST /v1/diagnose`: original six research fields plus either
+  `expected_telemetry_id` (latest-record guard) or
+  `selected_telemetry_id` (exact persisted record), never both.
+- `GET /v1/diagnosis?episode_id=...`: the persisted diagnosis with
+  the exact frame and observations used by the original E0 engine.
+
+H3 expects an invalid HMAC and unavailable sequence classification for
+the modified frame. PostgreSQL retains such received frames, but an
+invalid frame cannot advance the authenticated sequence watermark. VM-CONTROL records the intervention action and original pre-mutation frame from G2; VM-CORE persists the received telemetry and verification status.
+
+Focused tests are in `core/tests/test_operator_api.py` and
+`core/tests/test_h3_core_selection.py`.
+
+
+## H4 authenticated replay classification
+
+The H4 operator reuses `GET /v1/telemetry/match`,
+`POST /v1/diagnose` with `selected_telemetry_id`, and the persisted
+diagnosis-readback endpoint introduced for H1–H3. H4 uses the same telemetry matching, selected-record diagnosis and persisted result interfaces established for H1–H3.
+
+For a retransmitted, previously accepted 94-byte frame, the verifier
+records `mac_status=valid` because its signed bytes are unchanged.
+The persisted sequence watermark produces `sequence_status=stale`
+once the original and a strictly newer message have already been
+accepted for that node and boot. The H4 runner binds B6 inference to the selected persisted stale record.
+
+Focused tests are in `core/tests/test_h4_replay_selection.py`.

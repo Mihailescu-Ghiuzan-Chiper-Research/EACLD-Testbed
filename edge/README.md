@@ -66,3 +66,83 @@ Run the additional private control tests with:
     PYTHONPATH=edge/services/g2:shared python3 -m unittest discover -s edge/tests -p test_edge_control.py -v
 
 G2/agent roundtrip unit tests use a local Unix socket. The VM-EDGE services also participated in the distributed H1–H4 B01 execution.
+
+
+## H3 gateway evidence
+
+For controlled H3 experiments, G2 records the exact original and mutated
+94-byte frames when a one-shot mutation is successfully queued for MQTT
+forwarding. The evidence includes a monotonic per-process `event_id`,
+the byte offset, XOR mask and both frame payloads as hexadecimal strings.
+The HMAC bytes are not recalculated.
+
+VM-CONTROL may inspect:
+
+```text
+GET http://10.60.30.14:8300/v1/g2/intervention/status?node_id=1
+```
+
+The response contains `status`, `node_id`, `pending_action`
+(`mutate`, `replay` or `null`) and `last_mutation` (an object or
+`null`). Status requests are authorized only for the VM-CONTROL source,
+unlike the local health check. The corresponding G2 Unix-socket command
+is `{"action":"status","node_id":1}`.
+
+`last_mutation` remains available after the one-shot action is consumed
+or cleared, until another mutation of that node or a G2 service restart.
+Its publication counter indicates a successful *queue request*; reception
+and HMAC verification are confirmed independently from VM-CORE, using
+an exact stored-frame lookup.
+
+The executable operator procedure is in
+`control/experiments/h3_run.py`; its usage and artifact names are
+documented under `control/experiments/README.md`.
+
+Local focused tests:
+
+```bash
+PYTHONPATH=edge/services/g2:shared python3 -m unittest \
+  discover -s edge/tests -p test_h3_mutation_evidence.py -v
+```
+
+
+## H4 replay capture and evidence
+
+G2 keeps up to 64 recent successfully forwarded 94-byte frames per node.
+The H4 operator first identifies an authentic, fresh reference frame in
+VM-CORE and then stages the exact captured payload via:
+
+```text
+POST http://10.60.30.14:8300/v1/g2/intervention
+{"action":"replay","node_id":1,"frame_hex":"<188 lowercase hexadecimal characters>"}
+```
+
+The optional `frame_hex` extension selects a frame already in G2's
+recent forwarding history. The original `{"action":"replay","node_id":1}`
+control command remains available for previous users of the G2 one-shot
+primitive. An H4 experiment must use the exact-frame form.
+
+When a new sensor telemetry frame of the same node and boot arrives with
+a larger sequence number, G2 forwards it, then publishes the saved
+reference frame byte for byte (including the original 32-byte HMAC).
+No signing keys are used by G2.
+
+The restricted status endpoint described under H3 also exposes
+`last_replay`: a monotonically numbered event with
+`reference_frame_hex`, `trigger_frame_hex` and
+`replayed_frame_hex`. Both types of intervention events remain available
+until the next event of the same type for that node or a G2 restart.
+Status replies may exceed 1024 bytes when H3 and H4 events are both
+present; the agent supports replies up to 4096 bytes.
+
+VM-CONTROL compares G2's event with the exact stored VM-CORE records.
+G2's successful publish-request result is cross-checked against the
+authenticated/fresh triggering record and authentic/stale replay record in
+VM-CORE. H4 cleanup uses the same `clear` command as H3.
+
+Focused tests:
+
+```bash
+PYTHONPATH=edge/services/g2:shared python3 -m unittest \
+  discover -s edge/tests -p test_h4_replay_evidence.py -v
+```

@@ -14,6 +14,10 @@ import psycopg
 from eacld_contracts.topics import ACCEPTED_SUBSCRIPTION
 
 from .ingest import PostgresStore
+from .experiment_api import (
+    TelemetryChanged, parse_node, parse_episode, parse_frame_match,
+    summarize_reading, summarize_diagnosis,
+)
 from .runner import DiagnosisRunner, load_engine
 from .verifier import FrameVerifier, load_keyring
 
@@ -59,11 +63,20 @@ class CoreMqtt:
 
 
 def _valid_request(request: object, modes: list[str]) -> dict:
-    if not isinstance(request, dict) or set(request) != {
+    required = {
         "node_id", "mode", "episode_id", "block_id",
         "baseline_temperature_mC", "high_delta_mC"
-    }:
+    }
+    optional = set(request) - required if isinstance(request, dict) else None
+    if (not isinstance(request, dict) or not required.issubset(request)
+            or optional not in (set(), {"expected_telemetry_id"},
+                                {"selected_telemetry_id"})):
         raise ValueError("invalid diagnosis request fields")
+    for field in ("expected_telemetry_id", "selected_telemetry_id"):
+        if field in request:
+            selected = request[field]
+            if type(selected) is not int or selected < 1 or selected >= 1 << 63:
+                raise ValueError("invalid telemetry identifier")
     node = request["node_id"]
     if type(node) is not int or not 0 <= node <= 65535:
         raise ValueError("invalid node_id")
@@ -102,22 +115,78 @@ def create_control_server(runner: DiagnosisRunner, gateway: CoreMqtt, *,
         def do_GET(self) -> None:
             if not self.allowed(health=True):
                 self.send_json(403, {"detail": "forbidden"})
-            elif self.path != "/healthz":
-                self.send_json(404, {"detail": "not found"})
-            else:
+                return
+            if self.path == "/healthz":
                 online = gateway.ready.is_set()
                 self.send_json(200 if online else 503, {
                     "status": "ok" if online else "unavailable",
                     "service_version": VERSION
                 })
+                return
+            if not self.allowed():
+                self.send_json(403, {"detail": "forbidden"})
+                return
+            if self.path.startswith("/v1/telemetry/latest?"):
+                try:
+                    node_id = parse_node(self.path)
+                except ValueError:
+                    self.send_json(400, {"detail": "invalid telemetry query"})
+                    return
+                try:
+                    reading = runner.store.latest(node_id)
+                except (OSError, psycopg.Error):
+                    LOGGER.exception("VM-CORE telemetry lookup failed")
+                    self.send_json(503, {"detail": "telemetry backend unavailable"})
+                    return
+                if reading is None:
+                    self.send_json(404, {"detail": "no telemetry for node"})
+                else:
+                    self.send_json(200, summarize_reading(reading))
+                return
+            if self.path.startswith("/v1/telemetry/match?"):
+                try:
+                    node_id, after_id, frame = parse_frame_match(self.path)
+                except ValueError:
+                    self.send_json(400, {"detail": "invalid frame match query"})
+                    return
+                try:
+                    reading = runner.store.matching_frame(node_id, after_id, frame)
+                except (OSError, psycopg.Error):
+                    LOGGER.exception("VM-CORE frame lookup failed")
+                    self.send_json(503, {"detail": "telemetry backend unavailable"})
+                    return
+                if reading is None:
+                    self.send_json(404, {"detail": "no matching telemetry"})
+                else:
+                    self.send_json(200, summarize_reading(reading))
+                return
+            if self.path.startswith("/v1/diagnosis?"):
+                try:
+                    episode_id = parse_episode(self.path)
+                except ValueError:
+                    self.send_json(400, {"detail": "invalid diagnosis query"})
+                    return
+                try:
+                    record = runner.store.get_diagnosis(episode_id)
+                except (OSError, psycopg.Error, ValueError):
+                    LOGGER.exception("VM-CORE diagnosis evidence lookup failed")
+                    self.send_json(503, {"detail": "diagnosis evidence unavailable"})
+                    return
+                if record is None:
+                    self.send_json(404, {"detail": "unknown diagnosis episode"})
+                else:
+                    self.send_json(200, summarize_diagnosis(record))
+                return
+            self.send_json(404, {"detail": "not found"})
 
         def do_POST(self) -> None:
             if not self.allowed():
                 self.send_json(403, {"detail": "forbidden"})
                 return
-            if self.path != "/v1/diagnose":
+            if self.path not in ("/v1/diagnose", "/v1/evaluate"):
                 self.send_json(404, {"detail": "not found"})
                 return
+            evaluating = self.path == "/v1/evaluate"
             if not gateway.ready.is_set():
                 self.send_json(503, {"detail": "MQTT not ready"})
                 return
@@ -125,14 +194,31 @@ def create_control_server(runner: DiagnosisRunner, gateway: CoreMqtt, *,
                 n = int(self.headers.get("Content-Length", "-1"))
                 if not 1 <= n <= MAX_REQUEST:
                     raise ValueError("invalid request length")
-                kwargs = _valid_request(json.loads(self.rfile.read(n)), runner.config["modes"])
-            except (ValueError, TypeError, json.JSONDecodeError):
+                payload = json.loads(self.rfile.read(n))
+                random_seed = None
+                if evaluating:
+                    if not isinstance(payload, dict):
+                        raise ValueError("evaluation request must be a JSON object")
+                    payload = dict(payload)
+                    random_seed = payload.pop("random_seed")
+                    if (type(random_seed) is not int or not 0 <= random_seed < 1 << 63
+                            or "selected_telemetry_id" not in payload):
+                        raise ValueError("evaluation needs a seed and exact telemetry")
+                kwargs = _valid_request(payload, runner.config["modes"])
+            except (ValueError, TypeError, KeyError, json.JSONDecodeError):
                 self.send_json(400, {"detail": "invalid diagnosis request"})
                 return
             try:
-                result = runner.diagnose(**kwargs)
+                result = (runner.evaluate_policies(**kwargs, random_seed=random_seed)
+                          if evaluating else runner.diagnose(**kwargs))
+            except ValueError:
+                self.send_json(409, {"detail": "evaluation evidence mismatch"})
+                return
             except LookupError:
                 self.send_json(404, {"detail": "no accepted telemetry for requested node"})
+                return
+            except TelemetryChanged:
+                self.send_json(409, {"detail": "telemetry changed before diagnosis"})
                 return
             except psycopg.errors.UniqueViolation:
                 self.send_json(409, {"detail": "duplicate experiment episode_id"})
