@@ -14,6 +14,10 @@ import psycopg
 from eacld_contracts.topics import ACCEPTED_SUBSCRIPTION
 
 from .ingest import PostgresStore
+from .experiment_api import (
+    TelemetryChanged, parse_node, parse_episode,
+    summarize_reading, summarize_diagnosis,
+)
 from .runner import DiagnosisRunner, load_engine
 from .verifier import FrameVerifier, load_keyring
 
@@ -59,11 +63,19 @@ class CoreMqtt:
 
 
 def _valid_request(request: object, modes: list[str]) -> dict:
-    if not isinstance(request, dict) or set(request) != {
+    required = {
         "node_id", "mode", "episode_id", "block_id",
         "baseline_temperature_mC", "high_delta_mC"
-    }:
+    }
+    if not isinstance(request, dict) or not (
+        set(request) == required or
+        set(request) == required | {"expected_telemetry_id"}
+    ):
         raise ValueError("invalid diagnosis request fields")
+    if "expected_telemetry_id" in request:
+        expected = request["expected_telemetry_id"]
+        if type(expected) is not int or expected < 1 or expected >= 1 << 63:
+            raise ValueError("invalid expected telemetry identifier")
     node = request["node_id"]
     if type(node) is not int or not 0 <= node <= 65535:
         raise ValueError("invalid node_id")
@@ -102,14 +114,52 @@ def create_control_server(runner: DiagnosisRunner, gateway: CoreMqtt, *,
         def do_GET(self) -> None:
             if not self.allowed(health=True):
                 self.send_json(403, {"detail": "forbidden"})
-            elif self.path != "/healthz":
-                self.send_json(404, {"detail": "not found"})
-            else:
+                return
+            if self.path == "/healthz":
                 online = gateway.ready.is_set()
                 self.send_json(200 if online else 503, {
                     "status": "ok" if online else "unavailable",
                     "service_version": VERSION
                 })
+                return
+            if not self.allowed():
+                self.send_json(403, {"detail": "forbidden"})
+                return
+            if self.path.startswith("/v1/telemetry/latest?"):
+                try:
+                    node_id = parse_node(self.path)
+                except ValueError:
+                    self.send_json(400, {"detail": "invalid telemetry query"})
+                    return
+                try:
+                    reading = runner.store.latest(node_id)
+                except (OSError, psycopg.Error):
+                    LOGGER.exception("VM-CORE telemetry lookup failed")
+                    self.send_json(503, {"detail": "telemetry backend unavailable"})
+                    return
+                if reading is None:
+                    self.send_json(404, {"detail": "no telemetry for node"})
+                else:
+                    self.send_json(200, summarize_reading(reading))
+                return
+            if self.path.startswith("/v1/diagnosis?"):
+                try:
+                    episode_id = parse_episode(self.path)
+                except ValueError:
+                    self.send_json(400, {"detail": "invalid diagnosis query"})
+                    return
+                try:
+                    record = runner.store.get_diagnosis(episode_id)
+                except (OSError, psycopg.Error, ValueError):
+                    LOGGER.exception("VM-CORE diagnosis evidence lookup failed")
+                    self.send_json(503, {"detail": "diagnosis evidence unavailable"})
+                    return
+                if record is None:
+                    self.send_json(404, {"detail": "unknown diagnosis episode"})
+                else:
+                    self.send_json(200, summarize_diagnosis(record))
+                return
+            self.send_json(404, {"detail": "not found"})
 
         def do_POST(self) -> None:
             if not self.allowed():
@@ -133,6 +183,9 @@ def create_control_server(runner: DiagnosisRunner, gateway: CoreMqtt, *,
                 result = runner.diagnose(**kwargs)
             except LookupError:
                 self.send_json(404, {"detail": "no accepted telemetry for requested node"})
+                return
+            except TelemetryChanged:
+                self.send_json(409, {"detail": "telemetry changed before diagnosis"})
                 return
             except psycopg.errors.UniqueViolation:
                 self.send_json(409, {"detail": "duplicate experiment episode_id"})

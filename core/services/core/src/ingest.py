@@ -121,3 +121,30 @@ class PostgresStore:
                 VALUES (%s, %s, %s, %s, %s)
                 """, (public_result["episode_id"], public_result["block_id"],
                       node_id, telemetry_id, Jsonb(public_result)))
+
+    def get_diagnosis(self, episode_id: str) -> dict | None:
+        """Load a persisted diagnosis with the exact telemetry used at inference."""
+        with self.connect() as connection, connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT d.episode_id, d.block_id, d.node_id, d.created_at,
+                       d.result, t.id, t.node_id, t.payload,
+                       t.mac_status, t.sequence_status
+                FROM diagnoses d
+                JOIN received_telemetry t ON t.id = d.telemetry_id
+                WHERE d.episode_id = %s
+                """, (episode_id,))
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        if int(row[2]) != int(row[6]):
+            raise ValueError("diagnosis/telemetry node mismatch")
+        return {
+            "episode_id": row[0],
+            "block_id": row[1],
+            "node_id": int(row[2]),
+            "recorded_at_utc": row[3].isoformat(),
+            "result": row[4],
+            "reading": Reading(
+                int(row[5]), int(row[6]), bytes(row[7]), row[8], row[9]
+            ),
+        }

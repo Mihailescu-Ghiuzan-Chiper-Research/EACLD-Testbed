@@ -11,7 +11,7 @@ This service implements the EACLD virtual sensor population, authenticated MQTT 
 | Direct node challenge | NET-PROBE | POST http://10.60.20.12:8202/v1/challenge |
 | Restricted agent health | NET-CONTROL | GET http://10.60.30.12:8300/healthz |
 
-VM-NODES has static interfaces at 10.60.10.12, 10.60.20.12, 10.60.30.12 and 10.60.40.12. Administration uses `vmbr1` (VLAN 200). Docker Compose binds the NET-PROBE and NET-CONTROL listeners to their designated research-network addresses.
+VM-NODES has static interfaces at 10.60.10.12, 10.60.20.12, 10.60.30.12 and 10.60.40.12. System administration is separate on VMnet8. The Compose configuration publishes only the NET-PROBE and NET-CONTROL listeners on their respective research-network IPs; it does not publish ports on VMnet8.
 
 ## Runtime and source layout
 
@@ -20,9 +20,9 @@ VM-NODES has static interfaces at 10.60.10.12, 10.60.20.12, 10.60.30.12 and 10.6
 - `services/nodes/src/frame.py`: per-node boot identifier, shared sequence counter, nonce generation, and 94-byte HMAC-authenticated frame creation using the shared library.
 - `services/nodes/src/challenge.py`: `nonce_hex`, `node_id` request to `frame_hex` type-2 response, without traversing the telemetry gateway.
 
-Both telemetry and challenge frames for a given node share its boot identifier and sequence state. Challenge nonces are returned unmodified within the authenticated frame. MQTT messages are published only to `raw/<node_id>` using the `node` identity. MQTT QoS 1 is used for telemetry publication.
+Both telemetry and challenge frames for a given node share its boot identifier and sequence state. Challenge nonces are returned unmodified within the authenticated frame. MQTT messages are published only to `raw/<node_id>` using the `node` identity. QoS 1 is an implementation choice pending the experiment protocol; it does not change the wire format.
 
-The runtime reads process observations from VM-CONTROL and publishes authenticated telemetry. VM-CONTROL retains the private intervention record and activates node-local H2 measurement bias through the restricted control interface.
+The runtime independently reads VM-CONTROL for observations. It receives no private intervention labels, experiment truth, or injector configuration. Node-local bias values are implementation settings; their experimental activation/schedules are defined outside this software specification.
 
 ## Deployment files and confidential inputs
 
@@ -30,7 +30,7 @@ A **full repository checkout** at `/opt/eacld` is required for the Docker build,
 
     cp config/nodes.example.json config/nodes.json
 
-Edit `config/nodes.json` for the planned number of sensors, zones, protocol version, key versions, sampling interval and bias values. The example file defines two sample nodes; block B01 uses `node_id=1`. Provision `secrets/node_keys.json` **only on VM-NODES and to the verifier on VM-CORE** using unique cryptographically random keys, e.g.:
+Edit `config/nodes.json` for the planned number of sensors, zones, protocol version, key versions, sampling interval and bias values. The example defines two illustrative nodes; these are not experimental population assumptions. Provision `secrets/node_keys.json` **only on VM-NODES and to the verifier on VM-CORE** using unique cryptographically random keys, e.g.:
 
     {
       "1": {"1": "<64-or-more-hexadecimal-characters>"},
@@ -41,7 +41,7 @@ Create `secrets/mqtt_password` containing the broker password for the `node` MQT
 
     docker compose up --build -d
 
-Both HTTP listeners run in the same container, on distinct ports. `8300` accepts requests only from 10.60.30.10 and loopback. In addition, the host network/firewall configuration must restrict NET-CONTROL to the intended source; application checks alone do not establish the network topology. The NET-CONTROL listener provides readiness checks and restricted H2 measurement-bias control.
+Both HTTP listeners run in the same container, on distinct ports. `8300` accepts requests only from 10.60.30.10 and loopback. In addition, the host network/firewall configuration must restrict NET-CONTROL to the intended source; application checks alone do not establish the network topology. Agent configuration operations beyond health are not specified in V1 and have not been invented here.
 
 ## Verification
 
